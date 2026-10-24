@@ -34,6 +34,11 @@ Open http://localhost:5173
 | Officer | officer@agency.gov  | officer123  |
 | Driver  | driver@example.com  | driver123   |
 
+Or click **Create one** on the sign-in card to register a new account.
+
+- **Drivers** can sign up freely.
+- **Officers** need an agency access code. Start the backend with `ROADALERT_OFFICER_CODE=<code>` to enable officer sign-up; if it's unset, officer sign-up is turned off.
+
 Or click **Preview police/driver dashboard** for a no-backend demo with fictional data.
 
 ### Single-process mode
@@ -56,6 +61,7 @@ FastAPI then serves the built UI at http://localhost:8000.
 
 | Method | Path | Who |
 |--------|------|-----|
+| POST | `/api/v1/auth/signup` | anyone (officer role needs agency code) |
 | POST | `/api/v1/auth/login` | anyone |
 | POST | `/api/v1/auth/logout` | signed in |
 | GET  | `/api/v1/auth/me` | signed in |
@@ -72,14 +78,15 @@ Interactive docs: http://localhost:8000/docs
 - PBKDF2-SHA256 password hashing
 - Session in `HttpOnly`, `SameSite=Strict` cookie (8 h expiry); set `ROADALERT_SECURE_COOKIES=1` behind HTTPS
 - CSRF: double-submit token (`ra_csrf` cookie → `X-CSRF-Token` header) required on every state change
-- Login rate limit (10 attempts / 5 min per IP)
-- Audit log table for logins, failed logins, incident create/clear
+- Login rate limit (10 attempts / 5 min per IP); sign-up rate limit (10 / 10 min per IP)
+- Passwords: 8+ characters with a letter and a number (checked on client and server)
+- Audit log table for sign-ups, logins, failed logins, incident create/clear
 - Drivers only see active incidents < 12 h old
 
 ## Before real deployment
 
-Not included: MFA / agency SSO for officers, user registration and admin tools, Postgres, HTTPS hosting, push/SMS notifications, maps/geolocation, highway sign integration.
+Not included: MFA / agency SSO for officers, email verification, password reset, admin tools, Postgres, HTTPS hosting, push/SMS notifications, maps/geolocation, highway sign integration.
 
 **Do not use this to alert real motorists or control government highway signs without agency authorization.**
 
-Config: `ROADALERT_DB` (SQLite path), `ROADALERT_SECURE_COOKIES`.
+Config: `ROADALERT_DB` (SQLite path), `ROADALERT_SECURE_COOKIES`, `ROADALERT_OFFICER_CODE` (enables officer sign-up).

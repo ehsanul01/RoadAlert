@@ -1,4 +1,4 @@
-import type { Incident, NewIncident, User } from '../types';
+import type { Incident, NewIncident, Role, User } from '../types';
 
 export class ApiError extends Error {
   status: number;
@@ -44,6 +44,31 @@ export async function login(email: string, password: string): Promise<User> {
   const data = await request<{ user: User }>('/auth/login', {
     method: 'POST',
     body: JSON.stringify({ email, password }),
+  });
+  return data.user;
+}
+
+export interface SignupInput {
+  name: string;
+  email: string;
+  password: string;
+  role: Role;
+  agency?: string;
+  officerCode?: string;
+}
+
+/** Creates the account and signs the user in (the server sets the session cookie). */
+export async function signup(input: SignupInput): Promise<User> {
+  const data = await request<{ user: User }>('/auth/signup', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: input.name,
+      email: input.email,
+      password: input.password,
+      role: input.role,
+      agency: input.agency || null,
+      officer_code: input.officerCode || null,
+    }),
   });
   return data.user;
 }

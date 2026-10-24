@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -22,6 +23,8 @@ DB_PATH = os.environ.get("ROADALERT_DB", os.path.join(os.path.dirname(__file__),
 SESSION_TTL = 8 * 60 * 60  # 8 hours
 SECURE_COOKIES = os.environ.get("ROADALERT_SECURE_COOKIES", "0") == "1"  # set 1 behind HTTPS
 INCIDENT_MAX_AGE = 12 * 60 * 60  # active incidents older than this are hidden from drivers
+# Officers can only self-register with this agency code. Unset = officer signup disabled.
+OFFICER_SIGNUP_CODE = os.environ.get("ROADALERT_OFFICER_CODE", "")
 
 app = FastAPI(title="RoadAlert API", version="1.0.0")
 
@@ -104,13 +107,17 @@ def audit(c: sqlite3.Connection, user_id: str | None, action: str, detail: str =
 _attempts: dict[str, list[float]] = {}
 
 
-def rate_limit(ip: str, limit: int = 10, window: int = 300) -> None:
+def rate_limit(key: str, limit: int = 10, window: int = 300) -> None:
     t = time.time()
-    hits = [h for h in _attempts.get(ip, []) if t - h < window]
+    hits = [h for h in _attempts.get(key, []) if t - h < window]
     if len(hits) >= limit:
-        raise HTTPException(429, "Too many login attempts. Try again in a few minutes.")
+        raise HTTPException(429, "Too many attempts. Try again in a few minutes.")
     hits.append(t)
-    _attempts[ip] = hits
+    _attempts[key] = hits
+
+
+def client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
 
 
 # ---------- auth dependencies ----------
@@ -150,6 +157,18 @@ class LoginIn(BaseModel):
     password: str = Field(min_length=1, max_length=200)
 
 
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class SignupIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    email: str = Field(min_length=3, max_length=200)
+    password: str = Field(min_length=1, max_length=200)  # strength checked in password_problem()
+    role: Literal["officer", "driver"] = "driver"
+    agency: str | None = Field(default=None, max_length=120)
+    officer_code: str | None = Field(default=None, max_length=200)
+
+
 IncidentType = Literal["crash", "debris", "stalled_vehicle", "road_work", "weather", "closure", "other"]
 Severity = Literal["low", "moderate", "high", "critical"]
 Direction = Literal["NB", "SB", "EB", "WB", "Both"]
@@ -180,20 +199,75 @@ def health():
     return {"ok": True, "time": now_iso()}
 
 
+def start_session(c: sqlite3.Connection, user_id: str, response: Response) -> None:
+    """Create a server-side session and set the session + CSRF cookies."""
+    token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
+    c.execute("DELETE FROM sessions WHERE expires_at < ?", (time.time(),))
+    c.execute("INSERT INTO sessions VALUES (?,?,?,?)", (token, user_id, csrf, time.time() + SESSION_TTL))
+    response.set_cookie("ra_session", token, max_age=SESSION_TTL, httponly=True, samesite="strict", secure=SECURE_COOKIES, path="/")
+    response.set_cookie("ra_csrf", csrf, max_age=SESSION_TTL, httponly=False, samesite="strict", secure=SECURE_COOKIES, path="/")
+
+
+def password_problem(password: str) -> str | None:
+    """Return a human-readable reason the password is too weak, or None if it's fine."""
+    if len(password) < 8:
+        return "Password must be at least 8 characters."
+    if not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
+        return "Password must include at least one letter and one number."
+    return None
+
+
+@app.post("/api/v1/auth/signup", status_code=201)
+def signup(body: SignupIn, request: Request, response: Response):
+    rate_limit("signup:" + client_ip(request), limit=10, window=600)
+
+    name = body.name.strip()
+    email = body.email.strip().lower()
+    agency = (body.agency or "").strip() or None
+
+    if len(name) < 2:
+        raise HTTPException(422, "Please enter your full name.")
+    if not EMAIL_RE.match(email):
+        raise HTTPException(422, "Please enter a valid email address.")
+    if problem := password_problem(body.password):
+        raise HTTPException(422, problem)
+
+    # Anyone can sign up as a driver. Officers need the agency code set on the server,
+    # so nobody can just pick "officer" and start posting alerts.
+    if body.role == "officer":
+        if not OFFICER_SIGNUP_CODE:
+            raise HTTPException(403, "Officer sign-up is disabled. Ask your agency admin for an account.")
+        if not hmac.compare_digest(body.officer_code or "", OFFICER_SIGNUP_CODE):
+            raise HTTPException(403, "Invalid agency access code.")
+        if not agency:
+            raise HTTPException(422, "Please enter your agency.")
+    else:
+        agency = None
+
+    with db() as c:
+        if c.execute("SELECT 1 FROM users WHERE lower(email)=?", (email,)).fetchone():
+            raise HTTPException(409, "An account with this email already exists. Try signing in.")
+        user_id = "u-" + secrets.token_hex(8)
+        c.execute(
+            "INSERT INTO users VALUES (?,?,?,?,?,?)",
+            (user_id, name, email, hash_password(body.password), body.role, agency),
+        )
+        audit(c, user_id, "signup", body.role)
+        start_session(c, user_id, response)
+        row = c.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    return {"user": user_public(row)}
+
+
 @app.post("/api/v1/auth/login")
 def login(body: LoginIn, request: Request, response: Response):
-    rate_limit(request.client.host if request.client else "unknown")
+    rate_limit("login:" + client_ip(request))
     with db() as c:
         row = c.execute("SELECT * FROM users WHERE lower(email)=lower(?)", (body.email.strip(),)).fetchone()
         if not row or not verify_password(body.password, row["password_hash"]):
             audit(c, None, "login_failed", body.email)
             raise HTTPException(401, "Invalid email or password")
-        token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
-        c.execute("DELETE FROM sessions WHERE expires_at < ?", (time.time(),))
-        c.execute("INSERT INTO sessions VALUES (?,?,?,?)", (token, row["id"], csrf, time.time() + SESSION_TTL))
+        start_session(c, row["id"], response)
         audit(c, row["id"], "login")
-    response.set_cookie("ra_session", token, max_age=SESSION_TTL, httponly=True, samesite="strict", secure=SECURE_COOKIES, path="/")
-    response.set_cookie("ra_csrf", csrf, max_age=SESSION_TTL, httponly=False, samesite="strict", secure=SECURE_COOKIES, path="/")
     return {"user": user_public(row)}
 
 

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import LoginPage from './components/LoginPage';
+import AuthPage from './components/auth/AuthPage';
 import DashboardShell from './components/DashboardShell';
 import OfficerDashboard from './pages/OfficerDashboard';
 import DriverDashboard from './pages/DriverDashboard';
@@ -40,7 +40,7 @@ export default function App() {
     );
   }
 
-  if (!session) return <LoginPage onSignedIn={handleSignedIn} />;
+  if (!session) return <AuthPage onSignedIn={handleSignedIn} />;
 
   return (
     <DashboardShell session={session} onLogout={handleLogout}>
